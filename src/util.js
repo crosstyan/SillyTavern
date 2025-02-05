@@ -466,15 +466,43 @@ export function forwardFetchResponse(from, to) {
 
     if (from.body && to.socket) {
         from.body.pipe(to);
+        const CACHE_ROOT = `${globalThis.DATA_ROOT}/_cache`;
+        const now = new Date();
+        const fileName = `${CACHE_ROOT}/streaming-${now.toISOString()}.log`;
+        const fd = fs.openSync(fileName, 'w');
+        const stream = fs.createWriteStream('', { fd });
+        from.body.pipe(stream);
+
+        const onCloseLog = () => {
+            stream.end();
+        };
+
+        const checkAndDeleteOldLog = async () => {
+            const N = 10;
+            const files = (await fs.promises.readdir(CACHE_ROOT)).filter(f => f.startsWith('streaming-'));
+            if (files.length <= N) {
+                console.debug(`log counts (${files.length}) <= ${N}`);
+                return;
+            }
+            files.sort((a, b) => fs.statSync(path.join(CACHE_ROOT, a)).mtimeMs - fs.statSync(path.join(CACHE_ROOT, b)).mtimeMs);
+            for (const file of files.slice(0, files.length - N)) {
+                console.info(`Deleting old streaming log file '${file}'`);
+                await fs.promises.unlink(path.join(CACHE_ROOT, file));
+            }
+        };
 
         to.socket.on('close', function () {
             if (from.body instanceof Readable) from.body.destroy(); // Close the remote stream
 
+            onCloseLog();
             to.end(); // End the Express response
         });
 
         from.body.on('end', function () {
             console.info('Streaming request finished');
+
+            onCloseLog();
+            checkAndDeleteOldLog();
             to.end();
         });
     } else {

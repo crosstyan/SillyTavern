@@ -78,6 +78,7 @@ import { FILTER_TYPES, FilterHelper } from './filters.js';
 import { isExternalMediaAllowed } from './chats.js';
 import { POPUP_TYPE, Popup, callGenericPopup } from './popup.js';
 import { t } from './i18n.js';
+import { accountStorage } from './util/AccountStorage.js';
 
 export {
     selected_group,
@@ -690,7 +691,7 @@ export function getGroupBlock(group) {
 
     const template = $('#group_list_template .group_select').clone();
     template.data('id', group.id);
-    template.attr('grid', group.id);
+    template.attr('data-grid', group.id);
     template.find('.ch_name').text(group.name).attr('title', `[Group] ${group.name}`);
     template.find('.group_fav_icon').css('display', 'none');
     template.addClass(group.fav ? 'is_fav' : '');
@@ -1309,10 +1310,10 @@ function printGroupCandidates() {
         formatNavigator: PAGINATION_TEMPLATE,
         showNavigator: true,
         showSizeChanger: true,
-        pageSize: Number(localStorage.getItem(storageKey)) || 5,
+        pageSize: Number(accountStorage.getItem(storageKey)) || 5,
         sizeChangerOptions: [5, 10, 25, 50, 100, 200, 500, 1000],
         afterSizeSelectorChange: function (e) {
-            localStorage.setItem(storageKey, e.target.value);
+            accountStorage.setItem(storageKey, e.target.value);
         },
         callback: function (data) {
             $('#rm_group_add_members').empty();
@@ -1336,10 +1337,10 @@ function printGroupMembers() {
             formatNavigator: PAGINATION_TEMPLATE,
             showNavigator: true,
             showSizeChanger: true,
-            pageSize: Number(localStorage.getItem(storageKey)) || 5,
+            pageSize: Number(accountStorage.getItem(storageKey)) || 5,
             sizeChangerOptions: [5, 10, 25, 50, 100, 200, 500, 1000],
             afterSizeSelectorChange: function (e) {
-                localStorage.setItem(storageKey, e.target.value);
+                accountStorage.setItem(storageKey, e.target.value);
             },
             callback: function (data) {
                 $('.rm_group_members').empty();
@@ -1358,7 +1359,7 @@ function getGroupCharacterBlock(character) {
     template.data('id', character.avatar);
     template.find('.avatar img').attr({ 'src': avatar, 'title': character.avatar });
     template.find('.ch_name').text(character.name);
-    template.attr('chid', characters.indexOf(character));
+    template.attr('data-chid', characters.indexOf(character));
     template.find('.ch_fav').val(isFav);
     template.toggleClass('is_fav', isFav);
 
@@ -1644,7 +1645,7 @@ async function onGroupActionClick(event) {
     }
 
     if (action === 'speak') {
-        const chid = Number(member.attr('chid'));
+        const chid = Number(member.attr('data-chid'));
         if (Number.isInteger(chid)) {
             Generate('normal', { force_chid: chid });
         }
@@ -1663,12 +1664,12 @@ function updateFavButtonState(state) {
 export async function openGroupById(groupId) {
     if (isChatSaving) {
         toastr.info(t`Please wait until the chat is saved before switching characters.`, t`Your chat is still saving...`);
-        return;
+        return false;
     }
 
     if (!groups.find(x => x.id === groupId)) {
         console.log('Group not found', groupId);
-        return;
+        return false;
     }
 
     if (!is_send_press && !is_group_generating) {
@@ -1685,8 +1686,11 @@ export async function openGroupById(groupId) {
             updateChatMetadata({}, true);
             chat.length = 0;
             await getGroupChat(groupId);
+            return true;
         }
     }
+
+    return false;
 }
 
 function openCharacterDefinition(characterSelect) {
@@ -1696,7 +1700,7 @@ function openCharacterDefinition(characterSelect) {
         return;
     }
 
-    const chid = characterSelect.attr('chid');
+    const chid = characterSelect.attr('data-chid');
 
     if (chid === null || chid === undefined) {
         return;
@@ -2014,7 +2018,7 @@ jQuery(() => {
     }
 
     $(document).on('click', '.group_select', function () {
-        const groupId = $(this).attr('chid') || $(this).attr('grid') || $(this).data('id');
+        const groupId = $(this).attr('data-chid') || $(this).attr('data-grid');
         openGroupById(groupId);
     });
     $('#rm_group_filter').on('input', filterGroupMembers);

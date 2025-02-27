@@ -73,6 +73,7 @@ import { SlashCommandEnumValue } from './slash-commands/SlashCommandEnumValue.js
 import { Popup, POPUP_RESULT } from './popup.js';
 import { t } from './i18n.js';
 import { ToolManager } from './tool-calling.js';
+import { accountStorage } from './util/AccountStorage.js';
 
 export {
     openai_messages_count,
@@ -82,7 +83,6 @@ export {
     setOpenAIMessageExamples,
     setupChatCompletionPromptManager,
     sendOpenAIRequest,
-    getChatCompletionModel,
     TokenHandler,
     IdentifierNotFoundError,
     Message,
@@ -393,8 +393,8 @@ export let proxies = [
 ];
 export let selected_proxy = proxies[0];
 
-let openai_setting_names;
-let openai_settings;
+export let openai_setting_names;
+export let openai_settings;
 
 /** @type {import('./PromptManager.js').PromptManager} */
 export let promptManager = null;
@@ -414,7 +414,7 @@ async function validateReverseProxy() {
         throw err;
     }
     const rememberKey = `Proxy_SkipConfirm_${getStringHash(oai_settings.reverse_proxy)}`;
-    const skipConfirm = localStorage.getItem(rememberKey) === 'true';
+    const skipConfirm = accountStorage.getItem(rememberKey) === 'true';
 
     const confirmation = skipConfirm || await Popup.show.confirm(t`Connecting To Proxy`, await renderTemplateAsync('proxyConnectionWarning', { proxyURL: DOMPurify.sanitize(oai_settings.reverse_proxy) }));
 
@@ -425,7 +425,7 @@ async function validateReverseProxy() {
         throw new Error('Proxy connection denied.');
     }
 
-    localStorage.setItem(rememberKey, String(true));
+    accountStorage.setItem(rememberKey, String(true));
 }
 
 /**
@@ -1497,8 +1497,14 @@ async function sendWindowAIRequest(messages, signal, stream) {
     }
 }
 
-function getChatCompletionModel() {
-    switch (oai_settings.chat_completion_source) {
+/**
+ * Gets the API model for the selected chat completion source.
+ * @param {string} source If it's set, ignores active source
+ * @returns {string} API model
+ */
+export function getChatCompletionModel(source = null) {
+    const activeSource = source ?? oai_settings.chat_completion_source;
+    switch (activeSource) {
         case chat_completion_sources.CLAUDE:
             return oai_settings.claude_model;
         case chat_completion_sources.OPENAI:
@@ -1532,7 +1538,7 @@ function getChatCompletionModel() {
         case chat_completion_sources.DEEPSEEK:
             return oai_settings.deepseek_model;
         default:
-            throw new Error(`Unknown chat completion source: ${oai_settings.chat_completion_source}`);
+            throw new Error(`Unknown chat completion source: ${activeSource}`);
     }
 }
 
@@ -1869,7 +1875,7 @@ async function sendOpenAIRequest(type, messages, signal) {
     const isQuiet = type === 'quiet';
     const isImpersonate = type === 'impersonate';
     const isContinue = type === 'continue';
-    const stream = oai_settings.stream_openai && !isQuiet && !isScale && !(isGoogle && oai_settings.google_model.includes('bison')) && !(isOAI && (oai_settings.openai_model.startsWith('o1') || oai_settings.openai_model.startsWith('o3')));
+    const stream = oai_settings.stream_openai && !isQuiet && !isScale && !(isOAI && ['o1-2024-12-17', 'o1'].includes(oai_settings.openai_model));
     const useLogprobs = !!power_user.request_token_probabilities;
     const canMultiSwipe = oai_settings.n > 1 && !isContinue && !isImpersonate && !isQuiet && (isOAI || isCustom);
 
@@ -1916,6 +1922,10 @@ async function sendOpenAIRequest(type, messages, signal) {
         'include_reasoning': Boolean(oai_settings.show_thoughts),
         'reasoning_effort': String(oai_settings.reasoning_effort),
     };
+
+    if (!canMultiSwipe && ToolManager.canPerformToolCalls(type)) {
+        await ToolManager.registerFunctionToolsOpenAI(generate_data);
+    }
 
     // Empty array will produce a validation error
     if (!Array.isArray(generate_data.stop) || !generate_data.stop.length) {
@@ -2040,15 +2050,13 @@ async function sendOpenAIRequest(type, messages, signal) {
             delete generate_data.top_logprobs;
             delete generate_data.logprobs;
             delete generate_data.logit_bias;
+            delete generate_data.tools;
+            delete generate_data.tool_choice;
         }
     }
 
     if ((isOAI || isOpenRouter || isMistral || isCustom || isCohere || isNano) && oai_settings.seed >= 0) {
         generate_data['seed'] = oai_settings.seed;
-    }
-
-    if (!canMultiSwipe && ToolManager.canPerformToolCalls(type)) {
-        await ToolManager.registerFunctionToolsOpenAI(generate_data);
     }
 
     if (isOAI && (oai_settings.openai_model.startsWith('o1') || oai_settings.openai_model.startsWith('o3'))) {
@@ -2059,7 +2067,6 @@ async function sendOpenAIRequest(type, messages, signal) {
         });
         generate_data.max_completion_tokens = generate_data.max_tokens;
         delete generate_data.max_tokens;
-        delete generate_data.stream;
         delete generate_data.logprobs;
         delete generate_data.top_logprobs;
         delete generate_data.n;
@@ -2070,8 +2077,7 @@ async function sendOpenAIRequest(type, messages, signal) {
         delete generate_data.tools;
         delete generate_data.tool_choice;
         delete generate_data.stop;
-        // It does support logit_bias, but the tokenizer used and its effect is yet unknown.
-        // delete generate_data.logit_bias;
+        delete generate_data.logit_bias;
     }
 
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
@@ -2149,6 +2155,9 @@ async function sendOpenAIRequest(type, messages, signal) {
  */
 function getStreamingReply(data, state) {
     if (oai_settings.chat_completion_source === chat_completion_sources.CLAUDE) {
+        if (oai_settings.show_thoughts) {
+            state.reasoning += data?.delta?.thinking || '';
+        }
         return data?.delta?.text || '';
     } else if (oai_settings.chat_completion_source === chat_completion_sources.MAKERSUITE) {
         if (oai_settings.show_thoughts) {
@@ -2165,6 +2174,14 @@ function getStreamingReply(data, state) {
     } else if (oai_settings.chat_completion_source === chat_completion_sources.OPENROUTER) {
         if (oai_settings.show_thoughts) {
             state.reasoning += (data.choices?.filter(x => x?.delta?.reasoning)?.[0]?.delta?.reasoning || '');
+        }
+        return data.choices?.[0]?.delta?.content ?? data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
+    } else if (oai_settings.chat_completion_source === chat_completion_sources.CUSTOM) {
+        if (oai_settings.show_thoughts) {
+            state.reasoning +=
+                data.choices?.filter(x => x?.delta?.reasoning_content)?.[0]?.delta?.reasoning_content ??
+                data.choices?.filter(x => x?.delta?.reasoning)?.[0]?.delta?.reasoning ??
+                '';
         }
         return data.choices?.[0]?.delta?.content ?? data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
     } else {
@@ -3982,6 +3999,8 @@ function onSettingsPresetChange() {
         n: ['#n_openai', 'n', false],
     };
 
+    const presetNameBefore = oai_settings.preset_settings_openai;
+
     const presetName = $('#settings_preset_openai').find(':selected').text();
     oai_settings.preset_settings_openai = presetName;
 
@@ -4007,6 +4026,7 @@ function onSettingsPresetChange() {
         settingsToUpdate: settingsToUpdate,
         settings: oai_settings,
         savePreset: saveOpenAIPreset,
+        presetNameBefore: presetNameBefore,
     }).finally(r => {
         $('.model_custom_select').empty();
 
@@ -4105,6 +4125,40 @@ function getMaxContextWindowAI(value) {
         // default to gpt-3 (4095 tokens)
         return max_4k;
     }
+}
+
+/**
+ * Get the maximum context size for the Groq model
+ * @param {string} model Model identifier
+ * @param {boolean} isUnlocked Whether context limits are unlocked
+ * @returns {number} Maximum context size in tokens
+ */
+function getGroqMaxContext(model, isUnlocked) {
+    if (isUnlocked) {
+        return unlocked_max;
+    }
+
+    const contextMap = {
+        'gemma2-9b-it': max_8k,
+        'llama-3.3-70b-versatile': max_128k,
+        'llama-3.1-8b-instant': max_128k,
+        'llama3-70b-8192': max_8k,
+        'llama3-8b-8192': max_8k,
+        'llama-guard-3-8b': max_8k,
+        'mixtral-8x7b-32768': max_32k,
+        'deepseek-r1-distill-llama-70b': max_128k,
+        'llama-3.3-70b-specdec': max_8k,
+        'llama-3.2-1b-preview': max_128k,
+        'llama-3.2-3b-preview': max_128k,
+        'llama-3.2-11b-vision-preview': max_128k,
+        'llama-3.2-90b-vision-preview': max_128k,
+        'qwen-2.5-32b': max_128k,
+        'deepseek-r1-distill-qwen-32b': max_128k,
+        'deepseek-r1-distill-llama-70b-specdec': max_128k,
+    };
+
+    // Return context size if model found, otherwise default to 128k
+    return Object.entries(contextMap).find(([key]) => model.includes(key))?.[1] || max_128k;
 }
 
 async function onModelChange() {
@@ -4239,9 +4293,9 @@ async function onModelChange() {
             $('#openai_max_context').attr('max', max_2mil);
         } else if (value.includes('gemini-exp-1114') || value.includes('gemini-exp-1121') || value.includes('gemini-2.0-flash-thinking-exp-1219')) {
             $('#openai_max_context').attr('max', max_32k);
-        } else if (value.includes('gemini-1.5-pro') || value.includes('gemini-exp-1206')) {
+        } else if (value.includes('gemini-1.5-pro') || value.includes('gemini-exp-1206') || value.includes('gemini-2.0-pro')) {
             $('#openai_max_context').attr('max', max_2mil);
-        } else if (value.includes('gemini-1.5-flash') || value.includes('gemini-2.0-flash-exp') || value.includes('gemini-2.0-flash-thinking-exp')) {
+        } else if (value.includes('gemini-1.5-flash') || value.includes('gemini-2.0-flash')) {
             $('#openai_max_context').attr('max', max_1mil);
         } else if (value.includes('gemini-1.0-pro') || value === 'gemini-pro') {
             $('#openai_max_context').attr('max', max_32k);
@@ -4387,7 +4441,7 @@ async function onModelChange() {
         if (oai_settings.max_context_unlocked) {
             $('#openai_max_context').attr('max', unlocked_max);
         }
-        else if (['sonar', 'sonar-reasoning'].includes(oai_settings.perplexity_model)) {
+        else if (['sonar', 'sonar-reasoning', 'sonar-reasoning-pro', 'r1-1776'].includes(oai_settings.perplexity_model)) {
             $('#openai_max_context').attr('max', 127000);
         }
         else if (['sonar-pro'].includes(oai_settings.perplexity_model)) {
@@ -4408,33 +4462,8 @@ async function onModelChange() {
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.GROQ) {
-        if (oai_settings.max_context_unlocked) {
-            $('#openai_max_context').attr('max', unlocked_max);
-        } else if (oai_settings.groq_model.includes('gemma2-9b-it')) {
-            $('#openai_max_context').attr('max', max_8k);
-        } else if (oai_settings.groq_model.includes('llama-3.3-70b-versatile')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (oai_settings.groq_model.includes('llama-3.1-8b-instant')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (oai_settings.groq_model.includes('llama3-70b-8192')) {
-            $('#openai_max_context').attr('max', max_8k);
-        } else if (oai_settings.groq_model.includes('llama3-8b-8192')) {
-            $('#openai_max_context').attr('max', max_8k);
-        } else if (oai_settings.groq_model.includes('mixtral-8x7b-32768')) {
-            $('#openai_max_context').attr('max', max_32k);
-        } else if (oai_settings.groq_model.includes('deepseek-r1-distill-llama-70b')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (oai_settings.groq_model.includes('llama-3.3-70b-specdec')) {
-            $('#openai_max_context').attr('max', max_8k);
-        } else if (oai_settings.groq_model.includes('llama-3.2-1b-preview')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (oai_settings.groq_model.includes('llama-3.2-3b-preview')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (oai_settings.groq_model.includes('llama-3.2-11b-vision-preview')) {
-            $('#openai_max_context').attr('max', max_128k);
-        } else if (oai_settings.groq_model.includes('llama-3.2-90b-vision-preview')) {
-            $('#openai_max_context').attr('max', max_128k);
-        }
+        const maxContext = getGroqMaxContext(oai_settings.groq_model, oai_settings.max_context_unlocked);
+        $('#openai_max_context').attr('max', maxContext);
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
         oai_settings.temp_openai = Math.min(oai_max_temp, oai_settings.temp_openai);
@@ -4934,6 +4963,12 @@ export function isImageInliningSupported() {
     // gultra just isn't being offered as multimodal, thanks google.
     const visionSupportedModels = [
         'gpt-4-vision',
+        'gemini-2.0-pro-exp',
+        'gemini-2.0-pro-exp-02-05',
+        'gemini-2.0-flash-lite-preview',
+        'gemini-2.0-flash-lite-preview-02-05',
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-001',
         'gemini-2.0-flash-thinking-exp-1219',
         'gemini-2.0-flash-thinking-exp-01-21',
         'gemini-2.0-flash-thinking-exp',
@@ -4958,9 +4993,12 @@ export function isImageInliningSupported() {
         'gemini-1.5-pro-exp-0827',
         'claude-3',
         'claude-3-5',
+        'claude-3-7',
         'gpt-4-turbo',
         'gpt-4o',
         'gpt-4o-mini',
+        'o1',
+        'o1-2024-12-17',
         'chatgpt-4o-latest',
         'yi-vision',
         'pixtral-latest',

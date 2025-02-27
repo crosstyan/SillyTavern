@@ -28,6 +28,7 @@ import {
     cachingAtDepthForOpenRouterClaude,
     cachingAtDepthForClaude,
     getPromptNames,
+    calculateBudgetTokens,
 } from '../../prompt-converters.js';
 
 import { readSecret, SECRET_KEYS } from '../secrets.js';
@@ -106,8 +107,8 @@ async function sendClaudeRequest(request, response) {
     const apiUrl = new URL(request.body.reverse_proxy || API_CLAUDE).toString();
     const apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.CLAUDE);
     const divider = '-'.repeat(process.stdout.columns);
-    const enableSystemPromptCache = getConfigValue('claude.enableSystemPromptCache', false) && request.body.model.startsWith('claude-3');
-    let cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1);
+    const enableSystemPromptCache = getConfigValue('claude.enableSystemPromptCache', false, 'boolean') && request.body.model.startsWith('claude-3');
+    let cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1, 'number');
     // Disabled if not an integer or negative, or if the model doesn't support it
     if (!Number.isInteger(cachingAtDepth) || cachingAtDepth < 0 || !request.body.model.startsWith('claude-3')) {
         cachingAtDepth = -1;
@@ -125,9 +126,12 @@ async function sendClaudeRequest(request, response) {
             controller.abort();
         });
         const additionalHeaders = {};
+        const betaHeaders = ['output-128k-2025-02-19'];
         const useTools = request.body.model.startsWith('claude-3') && Array.isArray(request.body.tools) && request.body.tools.length > 0;
         const useSystemPrompt = (request.body.model.startsWith('claude-2') || request.body.model.startsWith('claude-3')) && request.body.claude_use_sysprompt;
         const convertedPrompt = convertClaudeMessages(request.body.messages, request.body.assistant_prefill, useSystemPrompt, useTools, getPromptNames(request));
+        const useThinking = request.body.model.startsWith('claude-3-7') && Boolean(request.body.include_reasoning);
+        let voidPrefill = false;
         // Add custom stop sequences
         const stopSequences = [];
         if (Array.isArray(request.body.stop)) {
@@ -155,16 +159,16 @@ async function sendClaudeRequest(request, response) {
             delete requestBody.system;
         }
         if (useTools) {
-            additionalHeaders['anthropic-beta'] = 'tools-2024-05-16';
+            betaHeaders.push('tools-2024-05-16');
             requestBody.tool_choice = { type: request.body.tool_choice };
             requestBody.tools = request.body.tools
                 .filter(tool => tool.type === 'function')
                 .map(tool => tool.function)
                 .map(fn => ({ name: fn.name, description: fn.description, input_schema: fn.parameters }));
 
-            // Claude doesn't do prefills on function calls, and doesn't allow empty messages
-            if (requestBody.tools.length && convertedPrompt.messages.length && convertedPrompt.messages[convertedPrompt.messages.length - 1].role === 'assistant') {
-                convertedPrompt.messages.push({ role: 'user', content: [{ type: 'text', text: '\u200b' }] });
+            if (requestBody.tools.length) {
+                // No prefill when using tools
+                voidPrefill = true;
             }
             if (enableSystemPromptCache && requestBody.tools.length) {
                 requestBody.tools[requestBody.tools.length - 1]['cache_control'] = { type: 'ephemeral' };
@@ -176,7 +180,38 @@ async function sendClaudeRequest(request, response) {
         }
 
         if (enableSystemPromptCache || cachingAtDepth !== -1) {
-            additionalHeaders['anthropic-beta'] = 'prompt-caching-2024-07-31';
+            betaHeaders.push('prompt-caching-2024-07-31');
+        }
+
+        if (useThinking) {
+            // No prefill when thinking
+            voidPrefill = true;
+            const reasoningEffort = request.body.reasoning_effort;
+            const budgetTokens = calculateBudgetTokens(requestBody.max_tokens, reasoningEffort, requestBody.stream);
+            const minThinkTokens = 1024;
+            if (requestBody.max_tokens <= minThinkTokens) {
+                const newValue = requestBody.max_tokens + minThinkTokens;
+                console.warn(color.yellow(`Claude thinking requires a minimum of ${minThinkTokens} response tokens.`));
+                console.info(color.blue(`Increasing response length to ${newValue}.`));
+                requestBody.max_tokens = newValue;
+            }
+            requestBody.thinking = {
+                type: 'enabled',
+                budget_tokens: budgetTokens,
+            };
+
+            // NO I CAN'T SILENTLY IGNORE THE TEMPERATURE.
+            delete requestBody.temperature;
+            delete requestBody.top_p;
+            delete requestBody.top_k;
+        }
+
+        if (voidPrefill && convertedPrompt.messages.length && convertedPrompt.messages[convertedPrompt.messages.length - 1].role === 'assistant') {
+            convertedPrompt.messages.push({ role: 'user', content: [{ type: 'text', text: '\u200b' }] });
+        }
+
+        if (betaHeaders.length) {
+            additionalHeaders['anthropic-beta'] = betaHeaders.join(',');
         }
 
         console.debug('Claude request:', requestBody);
@@ -288,7 +323,6 @@ async function sendMakerSuiteRequest(request, response) {
 
     const model = String(request.body.model);
     const stream = Boolean(request.body.stream);
-    const showThoughts = Boolean(request.body.include_reasoning);
     const isThinking = model.includes('thinking');
 
     const generationConfig = {
@@ -306,8 +340,9 @@ async function sendMakerSuiteRequest(request, response) {
         }
 
         const should_use_system_prompt = (
+            model.includes('gemini-2.0-pro') ||
+            model.includes('gemini-2.0-flash') ||
             model.includes('gemini-2.0-flash-thinking-exp') ||
-            model.includes('gemini-2.0-flash-exp') ||
             model.includes('gemini-1.5-flash') ||
             model.includes('gemini-1.5-pro') ||
             model.startsWith('gemini-exp')
@@ -316,9 +351,15 @@ async function sendMakerSuiteRequest(request, response) {
         const prompt = convertGooglePrompt(request.body.messages, model, should_use_system_prompt, getPromptNames(request));
         let safetySettings = GEMINI_SAFETY;
 
-        if (model.includes('gemini-2.0-flash-exp')) {
+        // These old models do not support setting the threshold to OFF at all.
+        if (['gemini-1.5-pro-001', 'gemini-1.5-flash-001', 'gemini-1.5-flash-8b-exp-0827', 'gemini-1.5-flash-8b-exp-0924', 'gemini-pro', 'gemini-1.0-pro', 'gemini-1.0-pro-001'].includes(model)) {
+            safetySettings = GEMINI_SAFETY.map(setting => ({ ...setting, threshold: 'BLOCK_NONE' }));
+        }
+        // Interestingly, Gemini 2.0 Flash does support setting the threshold for HARM_CATEGORY_CIVIC_INTEGRITY to OFF.
+        else if (['gemini-2.0-flash', 'gemini-2.0-flash-001', 'gemini-2.0-flash-exp'].includes(model)) {
             safetySettings = GEMINI_SAFETY.map(setting => ({ ...setting, threshold: 'OFF' }));
         }
+        // Most of the other models allow for setting the threshold of filters, except for HARM_CATEGORY_CIVIC_INTEGRITY, to OFF.
 
         let body = {
             contents: prompt.contents,
@@ -328,12 +369,6 @@ async function sendMakerSuiteRequest(request, response) {
 
         if (should_use_system_prompt) {
             body.systemInstruction = prompt.system_instruction;
-        }
-
-        if (isThinking && showThoughts) {
-            generationConfig.thinkingConfig = {
-                includeThoughts: true,
-            };
         }
 
         return body;
@@ -672,6 +707,11 @@ async function sendDeepSeekRequest(request, response) {
             bodyParams['logprobs'] = true;
         }
 
+        if (Array.isArray(request.body.tools) && request.body.tools.length > 0) {
+            bodyParams['tools'] = request.body.tools;
+            bodyParams['tool_choice'] = request.body.tool_choice;
+        }
+
         const postProcessType = String(request.body.model).endsWith('-reasoner') ? 'deepseek-reasoner' : 'deepseek';
         const processedMessages = postProcessPrompt(request.body.messages, postProcessType, getPromptNames(request));
 
@@ -964,7 +1004,7 @@ router.post('/generate', jsonParser, function (request, response) {
             bodyParams.logprobs = true;
         }
 
-        if (getConfigValue('openai.randomizeUserId', false)) {
+        if (getConfigValue('openai.randomizeUserId', false, 'boolean')) {
             bodyParams['user'] = uuidv4();
         }
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENROUTER) {
@@ -974,6 +1014,7 @@ router.post('/generate', jsonParser, function (request, response) {
         headers = { ...OPENROUTER_HEADERS };
         bodyParams = {
             'transforms': getOpenRouterTransforms(request),
+            'include_reasoning': Boolean(request.body.include_reasoning),
         };
 
         if (request.body.min_p !== undefined) {
@@ -999,11 +1040,7 @@ router.post('/generate', jsonParser, function (request, response) {
             bodyParams['route'] = 'fallback';
         }
 
-        if (request.body.include_reasoning) {
-            bodyParams['include_reasoning'] = true;
-        }
-
-        let cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1);
+        let cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1, 'number');
         if (Number.isInteger(cachingAtDepth) && cachingAtDepth >= 0 && request.body.model?.startsWith('anthropic/claude-3')) {
             cachingAtDepthForOpenRouterClaude(request.body.messages, cachingAtDepth);
         }

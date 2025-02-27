@@ -21,6 +21,7 @@ import { callGenericPopup, Popup, POPUP_TYPE } from './popup.js';
 import { StructuredCloneMap } from './util/StructuredCloneMap.js';
 import { renderTemplateAsync } from './templates.js';
 import { t } from './i18n.js';
+import { accountStorage } from './util/AccountStorage.js';
 
 export const world_info_insertion_strategy = {
     evenly: 0,
@@ -872,7 +873,7 @@ export function setWorldInfoSettings(settings, data) {
         $('#world_editor_select').append(`<option value='${i}'>${item}</option>`);
     });
 
-    $('#world_info_sort_order').val(localStorage.getItem(SORT_ORDER_KEY) || '0');
+    $('#world_info_sort_order').val(accountStorage.getItem(SORT_ORDER_KEY) || '0');
     $('#world_info').trigger('change');
     $('#world_editor_select').trigger('change');
 
@@ -1947,13 +1948,13 @@ function displayWorldEntries(name, data, navigation = navigation_option.none, fl
     if (typeof navigation === 'number' && Number(navigation) >= 0) {
         const data = getDataArray();
         const uidIndex = data.findIndex(x => x.uid === navigation);
-        const perPage = Number(localStorage.getItem(storageKey)) || perPageDefault;
+        const perPage = Number(accountStorage.getItem(storageKey)) || perPageDefault;
         startPage = Math.floor(uidIndex / perPage) + 1;
     }
 
     $('#world_info_pagination').pagination({
         dataSource: getDataArray,
-        pageSize: Number(localStorage.getItem(storageKey)) || perPageDefault,
+        pageSize: Number(accountStorage.getItem(storageKey)) || perPageDefault,
         sizeChangerOptions: [10, 25, 50, 100, 500, 1000],
         showSizeChanger: true,
         pageRange: 1,
@@ -1983,7 +1984,7 @@ function displayWorldEntries(name, data, navigation = navigation_option.none, fl
             worldEntriesList.append(blocks);
         },
         afterSizeSelectorChange: function (e) {
-            localStorage.setItem(storageKey, e.target.value);
+            accountStorage.setItem(storageKey, e.target.value);
         },
         afterPaging: function () {
             $('#world_popup_entries_list textarea[name="comment"]').each(function () {
@@ -2188,7 +2189,7 @@ function verifyWorldInfoSearchSortRule() {
     // If search got cleared, we make sure to hide the option and go back to the one before
     if (!searchTerm && !isHidden) {
         searchOption.attr('hidden', '');
-        selector.val(localStorage.getItem(SORT_ORDER_KEY) || '0');
+        selector.val(accountStorage.getItem(SORT_ORDER_KEY) || '0');
     }
 }
 
@@ -2437,7 +2438,9 @@ export async function getWorldEntry(name, data, entry) {
                     setWIOriginalDataValue(data, uid, originalDataValueName, data.entries[uid][entryPropName]);
                     await saveWorldInfo(name, data);
                 }
+                $(this).toggleClass('empty', !data.entries[uid][entryPropName].length);
             });
+            input.toggleClass('empty', !entry[entryPropName].length);
             input.on('select2:select', /** @type {function(*):void} */ event => updateWorldEntryKeyOptionsCache([event.params.data]));
             input.on('select2:unselect', /** @type {function(*):void} */ event => updateWorldEntryKeyOptionsCache([event.params.data], { remove: true }));
 
@@ -2472,6 +2475,7 @@ export async function getWorldEntry(name, data, entry) {
                     data.entries[uid][entryPropName] = splitKeywordsAndRegexes(value);
                     setWIOriginalDataValue(data, uid, originalDataValueName, data.entries[uid][entryPropName]);
                     await saveWorldInfo(name, data);
+                    $(this).toggleClass('empty', !data.entries[uid][entryPropName].length);
                 }
             });
             input.val(entry[entryPropName].join(', ')).trigger('input', { skipReset: true });
@@ -3449,7 +3453,7 @@ async function _save(name, data) {
         headers: getRequestHeaders(),
         body: JSON.stringify({ name: name, data: data }),
     });
-    eventSource.emit(event_types.WORLDINFO_UPDATED, name, data);
+    await eventSource.emit(event_types.WORLDINFO_UPDATED, name, data);
 }
 
 
@@ -4745,13 +4749,13 @@ export function checkEmbeddedWorld(chid) {
     }
 
     if (characters[chid]?.data?.character_book) {
-        $('#import_character_info').data('chid', chid).show();
+        $('#import_character_info').data('data-chid', chid).show();
 
         // Only show the alert once per character
         const checkKey = `AlertWI_${characters[chid].avatar}`;
         const worldName = characters[chid]?.data?.extensions?.world;
-        if (!localStorage.getItem(checkKey) && (!worldName || !world_names.includes(worldName))) {
-            localStorage.setItem(checkKey, 'true');
+        if (!accountStorage.getItem(checkKey) && (!worldName || !world_names.includes(worldName))) {
+            accountStorage.setItem(checkKey, 'true');
 
             if (power_user.world_import_dialog) {
                 const html = `<h3>This character has an embedded World/Lorebook.</h3>
@@ -4779,7 +4783,7 @@ export function checkEmbeddedWorld(chid) {
 }
 
 export async function importEmbeddedWorldInfo(skipPopup = false) {
-    const chid = $('#import_character_info').data('chid');
+    const chid = $('#import_character_info').data('data-chid');
 
     if (chid === undefined) {
         return;
@@ -5195,7 +5199,7 @@ jQuery(() => {
     $('#world_info_sort_order').on('change', function () {
         const value = String($(this).find(':selected').val());
         // Save sort order, but do not save search sorting, as this is a temporary sorting option
-        if (value !== 'search') localStorage.setItem(SORT_ORDER_KEY, value);
+        if (value !== 'search') accountStorage.setItem(SORT_ORDER_KEY, value);
         updateEditor(navigation_option.none);
     });
 

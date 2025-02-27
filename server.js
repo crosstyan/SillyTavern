@@ -30,6 +30,7 @@ import bodyParser from 'body-parser';
 
 // net related library imports
 import fetch from 'node-fetch';
+import ipRegex from 'ip-regex';
 
 // Unrestrict console logs display limit
 util.inspect.defaultOptions.maxArrayLength = null;
@@ -57,8 +58,10 @@ import {
 import getWebpackServeMiddleware from './src/middleware/webpack-serve.js';
 import basicAuthMiddleware from './src/middleware/basicAuth.js';
 import whitelistMiddleware from './src/middleware/whitelist.js';
+import accessLoggerMiddleware, { getAccessLogPath, migrateAccessLog } from './src/middleware/accessLogWriter.js';
 import multerMonkeyPatch from './src/middleware/multerMonkeyPatch.js';
 import initRequestProxy from './src/request-proxy.js';
+import getCacheBusterMiddleware from './src/middleware/cacheBuster.js';
 import {
     getVersion,
     getConfigValue,
@@ -130,6 +133,8 @@ if (process.versions && process.versions.node && process.versions.node.match(/20
 const DEFAULT_PORT = 8000;
 const DEFAULT_AUTORUN = false;
 const DEFAULT_LISTEN = false;
+const DEFAULT_LISTEN_ADDRESS_IPV6 = '[::]';
+const DEFAULT_LISTEN_ADDRESS_IPV4 = '0.0.0.0';
 const DEFAULT_CORS_PROXY = false;
 const DEFAULT_WHITELIST = true;
 const DEFAULT_ACCOUNTS = false;
@@ -185,6 +190,14 @@ const cliArguments = yargs(hideBin(process.argv))
         type: 'boolean',
         default: null,
         describe: `SillyTavern is listening on all network interfaces (Wi-Fi, LAN, localhost). If false, will limit it only to internal localhost (127.0.0.1).\nIf not provided falls back to yaml config 'listen'.\n[config default: ${DEFAULT_LISTEN}]`,
+    }).option('listenAddressIPv6', {
+        type: 'string',
+        default: null,
+        describe: 'Set SillyTavern to listen to a specific IPv6 address. If not set, it will fallback to listen to all.\n[config default: [::] ]',
+    }).option('listenAddressIPv4', {
+        type: 'string',
+        default: null,
+        describe: 'Set SillyTavern to listen to a specific IPv4 address. If not set, it will fallback to listen to all.\n[config default: 0.0.0.0 ]',
     }).option('corsProxy', {
         type: 'boolean',
         default: null,
@@ -231,7 +244,6 @@ const cliArguments = yargs(hideBin(process.argv))
         describe: 'Request proxy URL (HTTP or SOCKS protocols)',
     }).option('requestProxyBypass', {
         type: 'array',
-        default: null,
         describe: 'Request proxy bypass list (space separated list of hosts)',
     }).parseSync();
 
@@ -249,43 +261,47 @@ app.use(responseTime());
 
 
 /** @type {number} */
-const server_port = cliArguments.port ?? process.env.SILLY_TAVERN_PORT ?? getConfigValue('port', DEFAULT_PORT);
+const server_port = cliArguments.port ?? getConfigValue('port', DEFAULT_PORT, 'number');
 /** @type {boolean} */
-const autorun = (cliArguments.autorun ?? getConfigValue('autorun', DEFAULT_AUTORUN)) && !cliArguments.ssl;
+const autorun = (cliArguments.autorun ?? getConfigValue('autorun', DEFAULT_AUTORUN, 'boolean')) && !cliArguments.ssl;
 /** @type {boolean} */
-const listen = cliArguments.listen ?? getConfigValue('listen', DEFAULT_LISTEN);
-/** @type {boolean} */
-const enableCorsProxy = cliArguments.corsProxy ?? getConfigValue('enableCorsProxy', DEFAULT_CORS_PROXY);
-const enableWhitelist = cliArguments.whitelist ?? getConfigValue('whitelistMode', DEFAULT_WHITELIST);
+const listen = cliArguments.listen ?? getConfigValue('listen', DEFAULT_LISTEN, 'boolean');
 /** @type {string} */
-const dataRoot = cliArguments.dataRoot ?? getConfigValue('dataRoot', './data');
+const listenAddressIPv6 = cliArguments.listenAddressIPv6 ?? getConfigValue('listenAddress.ipv6', DEFAULT_LISTEN_ADDRESS_IPV6);
+/** @type {string} */
+const listenAddressIPv4 = cliArguments.listenAddressIPv4 ?? getConfigValue('listenAddress.ipv4', DEFAULT_LISTEN_ADDRESS_IPV4);
 /** @type {boolean} */
-const disableCsrf = cliArguments.disableCsrf ?? getConfigValue('disableCsrfProtection', DEFAULT_CSRF_DISABLED);
-const basicAuthMode = cliArguments.basicAuthMode ?? getConfigValue('basicAuthMode', DEFAULT_BASIC_AUTH);
-const perUserBasicAuth = getConfigValue('perUserBasicAuth', DEFAULT_PER_USER_BASIC_AUTH);
+const enableCorsProxy = cliArguments.corsProxy ?? getConfigValue('enableCorsProxy', DEFAULT_CORS_PROXY, 'boolean');
+const enableWhitelist = cliArguments.whitelist ?? getConfigValue('whitelistMode', DEFAULT_WHITELIST, 'boolean');
+/** @type {string} */
+globalThis.DATA_ROOT = cliArguments.dataRoot ?? getConfigValue('dataRoot', './data');
 /** @type {boolean} */
-const enableAccounts = getConfigValue('enableUserAccounts', DEFAULT_ACCOUNTS);
+const disableCsrf = cliArguments.disableCsrf ?? getConfigValue('disableCsrfProtection', DEFAULT_CSRF_DISABLED, 'boolean');
+const basicAuthMode = cliArguments.basicAuthMode ?? getConfigValue('basicAuthMode', DEFAULT_BASIC_AUTH, 'boolean');
+const perUserBasicAuth = getConfigValue('perUserBasicAuth', DEFAULT_PER_USER_BASIC_AUTH, 'boolean');
+/** @type {boolean} */
+const enableAccounts = getConfigValue('enableUserAccounts', DEFAULT_ACCOUNTS, 'boolean');
 
-const uploadsPath = path.join(dataRoot, UPLOADS_DIRECTORY);
+const uploadsPath = path.join(globalThis.DATA_ROOT, UPLOADS_DIRECTORY);
 
 
-/** @type {boolean | "auto"} */
-let enableIPv6 = stringToBool(cliArguments.enableIPv6) ?? getConfigValue('protocol.ipv6', DEFAULT_ENABLE_IPV6);
-/** @type {boolean | "auto"} */
-let enableIPv4 = stringToBool(cliArguments.enableIPv4) ?? getConfigValue('protocol.ipv4', DEFAULT_ENABLE_IPV4);
+/** @type {boolean | string} */
+let enableIPv6 = stringToBool(cliArguments.enableIPv6) ?? stringToBool(getConfigValue('protocol.ipv6', DEFAULT_ENABLE_IPV6)) ?? DEFAULT_ENABLE_IPV6;
+/** @type {boolean | string} */
+let enableIPv4 = stringToBool(cliArguments.enableIPv4) ?? stringToBool(getConfigValue('protocol.ipv4', DEFAULT_ENABLE_IPV4)) ?? DEFAULT_ENABLE_IPV4;
 
 /** @type {string} */
 const autorunHostname = cliArguments.autorunHostname ?? getConfigValue('autorunHostname', DEFAULT_AUTORUN_HOSTNAME);
 /** @type {number} */
-const autorunPortOverride = cliArguments.autorunPortOverride ?? getConfigValue('autorunPortOverride', DEFAULT_AUTORUN_PORT);
+const autorunPortOverride = cliArguments.autorunPortOverride ?? getConfigValue('autorunPortOverride', DEFAULT_AUTORUN_PORT, 'number');
 
 /** @type {boolean} */
-const dnsPreferIPv6 = cliArguments.dnsPreferIPv6 ?? getConfigValue('dnsPreferIPv6', DEFAULT_PREFER_IPV6);
+const dnsPreferIPv6 = cliArguments.dnsPreferIPv6 ?? getConfigValue('dnsPreferIPv6', DEFAULT_PREFER_IPV6, 'boolean');
 
 /** @type {boolean} */
-const avoidLocalhost = cliArguments.avoidLocalhost ?? getConfigValue('avoidLocalhost', DEFAULT_AVOID_LOCALHOST);
+const avoidLocalhost = cliArguments.avoidLocalhost ?? getConfigValue('avoidLocalhost', DEFAULT_AVOID_LOCALHOST, 'boolean');
 
-const proxyEnabled = cliArguments.requestProxyEnabled ?? getConfigValue('requestProxy.enabled', DEFAULT_PROXY_ENABLED);
+const proxyEnabled = cliArguments.requestProxyEnabled ?? getConfigValue('requestProxy.enabled', DEFAULT_PROXY_ENABLED, 'boolean');
 const proxyUrl = cliArguments.requestProxyUrl ?? getConfigValue('requestProxy.url', DEFAULT_PROXY_URL);
 const proxyBypass = cliArguments.requestProxyBypass ?? getConfigValue('requestProxy.bypass', DEFAULT_PROXY_BYPASS);
 
@@ -324,9 +340,17 @@ const CORS = cors({
 
 app.use(CORS);
 
-if (listen && basicAuthMode) app.use(basicAuthMiddleware);
+if (listen && basicAuthMode) {
+    app.use(basicAuthMiddleware);
+}
 
-app.use(whitelistMiddleware(enableWhitelist, listen));
+if (enableWhitelist) {
+    app.use(whitelistMiddleware());
+}
+
+if (listen) {
+    app.use(accessLoggerMiddleware());
+}
 
 if (enableCorsProxy) {
     app.use(bodyParser.json({
@@ -379,7 +403,7 @@ if (enableCorsProxy) {
 
 function getSessionCookieAge() {
     // Defaults to "no expiration" if not set
-    const configValue = getConfigValue('sessionTimeout', -1);
+    const configValue = getConfigValue('sessionTimeout', -1, 'number');
 
     // Convert to milliseconds
     if (configValue > 0) {
@@ -450,7 +474,7 @@ app.use(cookieSession({
     sameSite: 'strict',
     httpOnly: true,
     maxAge: getSessionCookieAge(),
-    secret: getCookieSecret(),
+    secret: getCookieSecret(globalThis.DATA_ROOT),
 }));
 
 app.use(setUserDataMiddleware);
@@ -500,7 +524,7 @@ if (!disableCsrf) {
 
 // Static files
 // Host index page
-app.get('/', (request, response) => {
+app.get('/', getCacheBusterMiddleware(), (request, response) => {
     if (shouldRedirectToLogin(request)) {
         const query = request.url.split('?')[1];
         const redirectUrl = query ? `/login?${query}` : '/login';
@@ -540,7 +564,13 @@ app.use('/api/users', usersPublicRouter);
 
 // Everything below this line requires authentication
 app.use(requireLoginMiddleware);
-app.get('/api/ping', (_, response) => response.sendStatus(204));
+app.get('/api/ping', (request, response) => {
+    if (request.query.extend && request.session) {
+        request.session.touch = Date.now();
+    }
+
+    response.sendStatus(204);
+});
 
 // File uploads
 app.use(multer({ dest: uploadsPath, limits: { fieldSize: 10 * 1024 * 1024 } }).single('avatar'));
@@ -708,13 +738,13 @@ app.use('/api/azure', azureRouter);
 
 const tavernUrlV6 = new URL(
     (cliArguments.ssl ? 'https://' : 'http://') +
-    (listen ? '[::]' : '[::1]') +
+    (listen ? (ipRegex.v6({ exact: true }).test(listenAddressIPv6) ? listenAddressIPv6 : '[::]') : '[::1]') +
     (':' + server_port),
 );
 
 const tavernUrl = new URL(
     (cliArguments.ssl ? 'https://' : 'http://') +
-    (listen ? '0.0.0.0' : '127.0.0.1') +
+    (listen ? (ipRegex.v4({ exact: true }).test(listenAddressIPv4) ? listenAddressIPv4 : '0.0.0.0') : '127.0.0.1') +
     (':' + server_port),
 );
 
@@ -738,6 +768,7 @@ const preSetupTasks = async function () {
     await checkForNewContent(directories);
     await ensureThumbnailCache();
     cleanUploads();
+    migrateAccessLog();
 
     await settingsInit();
     await statsInit();
@@ -837,15 +868,15 @@ const postSetupTasks = async function (v6Failed, v4Failed, useIPv6, useIPv4) {
     const plainGoToLog = removeColorFormatting(goToLog);
 
     console.log(logListen);
+    if (listen) {
+        console.log();
+        console.log('To limit connections to internal localhost only ([::1] or 127.0.0.1), change the setting in config.yaml to "listen: false".');
+        console.log('Check the "access.log" file in the data directory to inspect incoming connections:', color.green(getAccessLogPath()));
+    }
     console.log('\n' + getSeparator(plainGoToLog.length) + '\n');
     console.log(goToLog);
     console.log('\n' + getSeparator(plainGoToLog.length) + '\n');
 
-    if (listen) {
-        console.log(
-            '[::] or 0.0.0.0 means SillyTavern is listening on all network interfaces (Wi-Fi, LAN, localhost). If you want to limit it only to internal localhost ([::1] or 127.0.0.1), change the setting in config.yaml to "listen: false". Check "access.log" file in the SillyTavern directory if you want to inspect incoming connections.\n',
-        );
-    }
 
     if (basicAuthMode) {
         if (perUserBasicAuth && !enableAccounts) {
@@ -853,8 +884,9 @@ const postSetupTasks = async function (v6Failed, v4Failed, useIPv6, useIPv4) {
                 'Per-user basic authentication is enabled, but user accounts are disabled. This configuration may be insecure.',
             ));
         } else if (!perUserBasicAuth) {
-            const basicAuthUser = getConfigValue('basicAuthUser', {});
-            if (!basicAuthUser?.username || !basicAuthUser?.password) {
+            const basicAuthUserName = getConfigValue('basicAuthUser.username', '');
+            const basicAuthUserPassword = getConfigValue('basicAuthUser.password', '');
+            if (!basicAuthUserName || !basicAuthUserPassword) {
                 console.warn(color.yellow(
                     'Basic Authentication is enabled, but username or password is not set or empty!',
                 ));
@@ -901,7 +933,7 @@ function setWindowTitle(title) {
 function logSecurityAlert(message) {
     if (basicAuthMode || enableWhitelist) return; // safe!
     console.error(color.red(message));
-    if (getConfigValue('securityOverride', false)) {
+    if (getConfigValue('securityOverride', false, 'boolean')) {
         console.warn(color.red('Security has been overridden. If it\'s not a trusted network, change the settings.'));
         return;
     }
@@ -1083,7 +1115,7 @@ async function verifySecuritySettings() {
     }
 
     if (!enableAccounts) {
-        logSecurityAlert('Your SillyTavern is currently insecurely open to the public. Enable whitelisting, basic authentication or user accounts.');
+        logSecurityAlert('Your current SillyTavern configuration is insecure (listening to non-localhost). Enable whitelisting, basic authentication or user accounts.');
     }
 
     const users = await getAllEnabledUsers();
@@ -1114,7 +1146,7 @@ function apply404Middleware() {
 }
 
 // User storage module needs to be initialized before starting the server
-initUserStorage(dataRoot)
+initUserStorage(globalThis.DATA_ROOT)
     .then(ensurePublicDirectoriesExist)
     .then(migrateUserData)
     .then(migrateSystemPrompts)

@@ -372,7 +372,11 @@ router.post('/generate', jsonParser, async function (request, response) {
         }
 
         if (request.body.api_type === TEXTGEN_TYPES.OLLAMA) {
-            const keepAlive = getConfigValue('ollama.keepAlive', -1);
+            const keepAlive = Number(getConfigValue('ollama.keepAlive', -1, 'number'));
+            const numBatch = Number(getConfigValue('ollama.batchSize', -1, 'number'));
+            if (numBatch > 0) {
+                request.body['num_batch'] = numBatch;
+            }
             args.body = JSON.stringify({
                 model: request.body.model,
                 prompt: request.body.prompt,
